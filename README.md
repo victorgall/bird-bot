@@ -45,3 +45,22 @@ If that text arrives, Day 1 is done — the entire plumbing works end to end.
 - Check the "Logs" tab in Render — it'll show exactly what happened (or didn't)
 - Double check the phone numbers are in full international format (+44 not 07...)
 - Make sure both Voice and SMS were ticked as capabilities when you bought the Twilio number
+
+## Day 3 — the AI conversation layer
+
+The code now handles a full back-and-forth text conversation using Claude, not just a single static reply.
+
+### New environment variables to add in Render
+- `ANTHROPIC_API_KEY` — from console.anthropic.com
+- `MANAGER_NUMBER` — the phone number that should receive the final booking summary (can be the same as `FORWARD_TO_NUMBER` while you're the only one testing)
+
+### New Twilio webhook to set up
+Just like you did for the Voice webhook, go to your number's settings in Twilio and find the **Messaging Configuration** section. Set "A message comes in" to Webhook, paste in:
+`https://your-render-url.onrender.com/sms`
+Method: HTTP POST. Save.
+
+### How the conversation logic works
+- Every text the customer sends triggers `/sms`, which sends the whole conversation so far to Claude and gets a reply.
+- The AI is told (via the SYSTEM_PROMPT in server.js) to treat Friday/Saturday 7-8:30pm as fully booked and offer alternatives — this is placeholder logic standing in for a real calendar until Bird in Hand can grant DesignMyNight API access.
+- When the AI finalizes a booking, it appends a hidden marker to its own reply. The code detects this, strips it out of what the customer sees, and sends a separate clean summary text to `MANAGER_NUMBER` for manual entry into the real booking system.
+- Conversations are stored in memory per phone number — this resets if Render restarts the server, which is fine for testing but worth knowing.
