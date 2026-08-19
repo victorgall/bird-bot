@@ -70,6 +70,55 @@ function addBooking(booking) {
   bookings.push(booking);
 }
 
+// Scans forward from (date, time) — same day first, prioritising times close
+// to the original request, then subsequent days — and returns real available
+// slots. This exists so Claude never has to guess a candidate time; it asks
+// for genuine alternatives instead.
+function findAlternatives(date, time, partySize, isPrivateRoom = false, maxSuggestions = 2, maxDaysAhead = 7) {
+  const suggestions = [];
+  const startDate = new Date(date);
+
+  function candidateTimesForDate(dateStr) {
+    const day = new Date(dateStr).toLocaleDateString('en-GB', { weekday: 'long' }).toLowerCase();
+    const windows = CONFIG.serviceHours[day] || [];
+    const times = [];
+    for (const w of windows) {
+      let cursor = toMinutes(w.start);
+      const end = toMinutes(w.end);
+      while (cursor <= end) {
+        const hh = String(Math.floor(cursor / 60)).padStart(2, '0');
+        const mm = String(cursor % 60).padStart(2, '0');
+        times.push(`${hh}:${mm}`);
+        cursor += 30;
+      }
+    }
+    return times;
+  }
+
+  for (let dayOffset = 0; dayOffset <= maxDaysAhead && suggestions.length < maxSuggestions; dayOffset++) {
+    const d = new Date(startDate);
+    d.setDate(startDate.getDate() + dayOffset);
+    const dateStr = d.toISOString().split('T')[0];
+    let times = candidateTimesForDate(dateStr);
+
+    if (dayOffset === 0) {
+      times = times
+        .filter((t) => t !== time)
+        .sort((a, b) => Math.abs(toMinutes(a) - toMinutes(time)) - Math.abs(toMinutes(b) - toMinutes(time)));
+    }
+
+    for (const t of times) {
+      const result = checkAvailability(dateStr, t, partySize, isPrivateRoom);
+      if (result.available) {
+        suggestions.push({ date: dateStr, time: t });
+        if (suggestions.length >= maxSuggestions) break;
+      }
+    }
+  }
+
+  return suggestions;
+}
+
 // Resolves a day name (e.g. "saturday") to the next real calendar date after
 // fromDate, in YYYY-MM-DD format. Always returns the NEXT occurrence, never today.
 function getDateForUpcomingDay(dayName, fromDate = new Date()) {
@@ -115,6 +164,7 @@ function seedDemoData() {
 module.exports = {
   CONFIG,
   checkAvailability,
+  findAlternatives,
   addBooking,
   bookings,
   getDateForUpcomingDay,
