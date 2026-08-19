@@ -64,7 +64,7 @@ const FIND_ALTERNATIVES_TOOL = {
 };
 
 // Builds the system prompt fresh each turn so the date list is always current.
-function buildSystemPrompt() {
+function buildSystemPrompt(customerNumber) {
   const dateContext = availability.getUpcomingDates(14)
     .map((d) => `${d.dayName} ${d.date}`)
     .join('\n');
@@ -75,6 +75,8 @@ Someone just called and couldn't get through (the pub was busy), so you're texti
 
 Today's date and the next 14 days are:
 ${dateContext}
+
+The customer is texting from ${customerNumber}. If you need a callback number for a private room request, this is their default number unless they give you a different one.
 
 When the customer mentions a day (like "Saturday"), match it against this list to get the exact date. Never calculate or guess dates yourself.
 
@@ -87,7 +89,16 @@ Your job:
 [BOOKING_CONFIRMED|<partySize>|<date>|<time>|<name or "not given">|<occasion or "not given">]
 Do not include this line in any message except the final confirmation. Never mention this line to the customer or explain it — it is only for internal system use.
 
-Never mention table numbers or any internal system details. If they ask about the private dining room, always say it's pending manager confirmation rather than confirming it outright — never send a [BOOKING_CONFIRMED] line for a private room request.`;
+If they ask about the private dining room, handle it separately from the steps above:
+- Never call check_availability or find_alternative_times for it, and never confirm it yourself.
+- Gather party size, date, time, occasion, and a name, same as a normal request.
+- Ask if their texting number (${customerNumber}) is the best number for the manager to call them back on, or if they'd rather give a different one.
+- Once you have all of that, tell them it sounds lovely and the manager will call to confirm — never say it's booked or confirmed.
+- On that message ONLY, append this hidden marker at the very end, with real values filled in and separated by "|":
+[PRIVATE_ROOM_REQUEST|<partySize>|<date>|<time>|<name>|<occasion>|<callbackNumber>]
+Never include this marker in any other message, never mention it to the customer, and never send a [BOOKING_CONFIRMED] line for a private room request.
+
+Never mention table numbers or any internal system details.`;
 }
 
 // Looks for the hidden [BOOKING_CONFIRMED ...] marker, strips it from the customer-facing
@@ -102,6 +113,20 @@ function extractBooking(replyText) {
   return { cleanText, booking: { partySize: Number(partySize), date, time, name, occasion } };
 }
 
+// Looks for the hidden [PRIVATE_ROOM_REQUEST ...] marker, strips it from the
+// customer-facing text, and returns the clean text plus the parsed request
+// details if present. This is what lets the manager actually hear about a
+// private room enquiry, since the AI never auto-confirms these itself.
+function extractPrivateRoomRequest(replyText) {
+  const match = replyText.match(/\[PRIVATE_ROOM_REQUEST\|([^\]]*)\]/);
+  if (!match) {
+    return { cleanText: replyText, privateRoomRequest: null };
+  }
+  const cleanText = replyText.replace(match[0], '').trim();
+  const [partySize, date, time, name, occasion, callbackNumber] = match[1].split('|').map((s) => s.trim());
+  return { cleanText, privateRoomRequest: { partySize: Number(partySize), date, time, name, occasion, callbackNumber } };
+}
+
 // Calls Claude with the full conversation so far, handling any tool calls it
 // makes along the way, and returns its final reply text.
 async function getAssistantReply(phoneNumber, customerMessage) {
@@ -111,7 +136,7 @@ async function getAssistantReply(phoneNumber, customerMessage) {
   const history = conversations[phoneNumber];
   history.push({ role: 'user', content: customerMessage });
 
-  const systemPrompt = buildSystemPrompt();
+  const systemPrompt = buildSystemPrompt(phoneNumber);
 
   const tools = [AVAILABILITY_TOOL, FIND_ALTERNATIVES_TOOL];
 
@@ -233,7 +258,8 @@ app.post('/sms', async (req, res) => {
 
   try {
     const rawReply = await getAssistantReply(customerNumber, customerMessage);
-    const { cleanText, booking } = extractBooking(rawReply);
+    const { cleanText: afterBooking, booking } = extractBooking(rawReply);
+    const { cleanText, privateRoomRequest } = extractPrivateRoomRequest(afterBooking);
 
     twiml.message(cleanText);
 
@@ -256,6 +282,18 @@ app.post('/sms', async (req, res) => {
         to: MANAGER_NUMBER,
         from: TWILIO_NUMBER,
         body: `New booking via missed-call assistant: ${booking.partySize} people, ${booking.date} at ${booking.time}. Name: ${booking.name}. Occasion: ${booking.occasion}. Customer: ${customerNumber}. Please add to the calendar.`,
+      });
+    }
+
+    if (privateRoomRequest) {
+      console.log('Private room request:', privateRoomRequest);
+
+      // No availability write here — this is deliberately NOT auto-confirmed.
+      // The manager has to call back and confirm it themselves.
+      await client.messages.create({
+        to: MANAGER_NUMBER,
+        from: TWILIO_NUMBER,
+        body: `Private room enquiry via missed-call assistant — please call to confirm: ${privateRoomRequest.partySize} people, ${privateRoomRequest.date} at ${privateRoomRequest.time}. Name: ${privateRoomRequest.name}. Occasion: ${privateRoomRequest.occasion}. Callback number: ${privateRoomRequest.callbackNumber}.`,
       });
     }
   } catch (err) {
