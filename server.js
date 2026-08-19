@@ -45,6 +45,24 @@ const AVAILABILITY_TOOL = {
   },
 };
 
+// Tool Claude uses to find REAL alternatives when a requested time is
+// unavailable, instead of guessing a nearby time and finding out it's also
+// full. Returns up to 2 genuinely available slots.
+const FIND_ALTERNATIVES_TOOL = {
+  name: 'find_alternative_times',
+  description: 'Use this whenever check_availability comes back unavailable, BEFORE saying anything to the customer about alternatives. Returns real available slots near the requested time, so you never offer a time that turns out to also be full.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      date: { type: 'string', description: 'The originally requested date, YYYY-MM-DD.' },
+      time: { type: 'string', description: 'The originally requested time, HH:MM.' },
+      partySize: { type: 'integer', description: 'Number of people in the party.' },
+      isPrivateRoom: { type: 'boolean', description: 'True only if they specifically asked for the private dining room.' },
+    },
+    required: ['date', 'time', 'partySize'],
+  },
+};
+
 // Builds the system prompt fresh each turn so the date list is always current.
 function buildSystemPrompt() {
   const dateContext = availability.getUpcomingDates(14)
@@ -63,7 +81,7 @@ When the customer mentions a day (like "Saturday"), match it against this list t
 Your job:
 1. Find out what they want: party size, date, time, and occasion if mentioned.
 2. Once you have party size and date (and roughly a time — assume 13:00 for lunch or 19:00 for dinner if they don't give one), call the check_availability tool. Never state availability without calling the tool first.
-3. If the tool says unavailable, apologise briefly in one short sentence, then offer one or two alternative times or days as a question. Once they respond with a new choice, call check_availability again for it — don't assume it's free.
+3. If check_availability says unavailable, do NOT guess or suggest a time yourself. Call find_alternative_times first to get real options, then apologise briefly in one short sentence and offer those specific options as a question. Never mention a time to the customer that you have not confirmed is available.
 4. Once they confirm a specific time the tool has confirmed as available, thank them and confirm the booking in one friendly message.
 5. On that final confirmation message ONLY, append a new line at the very end in this exact format, with real values filled in and separated by "|":
 [BOOKING_CONFIRMED|<partySize>|<date>|<time>|<name or "not given">|<occasion or "not given">]
@@ -95,33 +113,44 @@ async function getAssistantReply(phoneNumber, customerMessage) {
 
   const systemPrompt = buildSystemPrompt();
 
+  const tools = [AVAILABILITY_TOOL, FIND_ALTERNATIVES_TOOL];
+
   let response = await anthropic.messages.create({
     model: 'claude-sonnet-4-5',
     max_tokens: 300,
     system: systemPrompt,
     messages: history,
-    tools: [AVAILABILITY_TOOL],
+    tools,
   });
 
-  // Claude may call the tool more than once in a turn (e.g. checking Saturday,
-  // then checking Tuesday once the customer picks an alternative). Cap the
-  // loop so a stuck request can't run forever.
+  // Claude may call tools more than once in a turn (e.g. check Saturday 7pm,
+  // find alternatives, then check the customer's chosen alternative). Cap
+  // the loop so a stuck request can't run forever.
   let toolRoundTrips = 0;
-  while (response.stop_reason === 'tool_use' && toolRoundTrips < 3) {
+  while (response.stop_reason === 'tool_use' && toolRoundTrips < 4) {
     toolRoundTrips += 1;
     history.push({ role: 'assistant', content: response.content });
 
     const toolResults = [];
     for (const block of response.content) {
-      if (block.type === 'tool_use' && block.name === 'check_availability') {
-        const { date, time, partySize, isPrivateRoom } = block.input;
-        const result = availability.checkAvailability(date, time, partySize, !!isPrivateRoom);
-        toolResults.push({
-          type: 'tool_result',
-          tool_use_id: block.id,
-          content: JSON.stringify(result),
-        });
+      if (block.type !== 'tool_use') continue;
+
+      let result;
+      const { date, time, partySize, isPrivateRoom } = block.input;
+
+      if (block.name === 'check_availability') {
+        result = availability.checkAvailability(date, time, partySize, !!isPrivateRoom);
+      } else if (block.name === 'find_alternative_times') {
+        result = { alternatives: availability.findAlternatives(date, time, partySize, !!isPrivateRoom) };
+      } else {
+        result = { error: `Unknown tool: ${block.name}` };
       }
+
+      toolResults.push({
+        type: 'tool_result',
+        tool_use_id: block.id,
+        content: JSON.stringify(result),
+      });
     }
     history.push({ role: 'user', content: toolResults });
 
@@ -130,7 +159,7 @@ async function getAssistantReply(phoneNumber, customerMessage) {
       max_tokens: 300,
       system: systemPrompt,
       messages: history,
-      tools: [AVAILABILITY_TOOL],
+      tools,
     });
   }
 
